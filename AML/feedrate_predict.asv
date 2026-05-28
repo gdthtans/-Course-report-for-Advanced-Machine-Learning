@@ -1,0 +1,447 @@
+%% 初始数据获取
+%机器人采回数据
+ A= importdata('RobotPos250624.txt');
+ B= importdata('pnt.txt');
+pntG=B;
+% A= importdata('RobotPos0112.txt');
+
+Sampledatas=A(860:end,:,:,:,:,:,:,:,:);%1195:136697/25-2;860:end/24;  
+Sampledatas(:,4)=deg2rad(Sampledatas(:,4));Sampledatas(:,5)=deg2rad(Sampledatas(:,5));Sampledatas(:,6)=deg2rad(Sampledatas(:,6));
+Robot_XYZXYZs = Sampledatas(:,1:6);
+
+
+cur_ser=0+1;rob_ser=1;
+rob_time=linspace(1,length(Robot_XYZXYZs),length(Robot_XYZXYZs)); %查看参数变化过程
+%将位置与刀路点相对应
+for i=1:length(Robot_XYZXYZs)
+    if cur_ser>=length(pntG)
+        break
+    end
+    x1=norm(pntG(cur_ser+1,1:3)-Robot_XYZXYZs(i,1:3)); %当前位置到当前刀路点
+    x0=norm(pntG(cur_ser,1:3)-Robot_XYZXYZs(i,1:3));
+    if x1<1&&x1<x0
+        cur_ser=cur_ser+1; 
+        rob_ser=[rob_ser,i];
+    end
+     rob_time(i)=cur_ser;                                                                                  
+
+
+
+    if i>=6
+    V_Path(i)=norm(Robot_XYZXYZs(i,1:3)-Robot_XYZXYZs(i-5,1:3))/(5*0.004);
+    else
+        V_Path(i)=0;%在固高里改成从机器人处读取速度
+    end
+
+     if rob_time(i)>length(pntG)
+         rob_time(i)=length(pntG);
+     end
+     %速度滤波环节
+
+   
+end
+
+
+%% 群延时分析与补偿
+Pos_meas = Robot_XYZXYZs(:,1:3); 
+Ts = 0.004;             % 采样周期 4ms
+Fs = 1/Ts;              % 采样频率 250Hz
+T_total = length(Robot_XYZXYZs)*Ts;          
+t = (0:Ts:T_total-Ts)'; % 时间向量
+N = length(t);
+f_motion = 1.5; % 运动频率 1.5Hz
+k_diff = 1; % 差分步长
+V_raw_components = zeros(N, 3);
+
+% 计算各轴速度分量
+for i = (1+k_diff):(N-k_diff)
+    V_raw_components(i, :) = (Pos_meas(i+k_diff, :) - Pos_meas(i-k_diff, :)) / (2*k_diff*Ts);
+end
+V_raw = sqrt(sum(V_raw_components.^2, 2));
+fc = 8; % 截止频率 8Hz (稍低一点以滤除噪声)
+order = 2; % 二阶 Butterworth
+[b, a] = butter(order, fc/(Fs/2), 'low');
+
+Pos_filtered = zeros(size(Pos_meas));
+V_filt_components = zeros(N, 3);
+
+% 对 X, Y, Z 分别滤波
+for col = 1:3
+    Pos_filtered(:, col) = filter(b, a, Pos_meas(:, col));
+    V_filt_temp = diff(Pos_filtered(:, col)) / Ts;
+    % 补齐长度
+    V_filt_components(:, col) = [0; V_filt_temp];
+end
+
+V_filt = sqrt(sum(V_filt_components.^2, 2));
+
+[gd, w] = grpdelay(b, a, 512, Fs);
+
+% 获取运动主频附近的群延时
+target_freq_idx = find(w >= f_motion, 1);
+delay_samples = round(gd(target_freq_idx)); 
+delay_time_ms = delay_samples * Ts * 1000;
+
+fprintf('------------------------------------------------\n');
+fprintf('滤波器参数: Order=%d, Fc=%.1f Hz\n', order, fc);
+fprintf('主频 %.1f Hz 处的群延时: %.2f samples (%.2f ms)\n', f_motion, gd(target_freq_idx), delay_time_ms);
+fprintf('------------------------------------------------\n');
+
+shifted_mag = [V_filt(delay_samples+1:end); zeros(delay_samples, 1)]; 
+V_compensated_mag = shifted_mag;
+
+%% 参数域SARIMA预测模型建立
+ %时间序列预测：基于参数的SARIMA模型
+
+
+for i=1:length(rob_time)
+    if rob_time(i)>3011
+        rob_time(i)=3012;
+    end
+end
+point_rob=Robot_XYZXYZs(1:134597,:);%剔除重复点坐标
+
+scatter3(Robot_XYZXYZs(:,1),Robot_XYZXYZs(:,2),Robot_XYZXYZs(:,3),5,rob_time,'filled');hold on;
+
+%先简单处理横坐标，序号之间线性插值V_acc
+sarima_num=para_interp(rob_time(1:134597));
+rob_par=interp1(sarima_num,point_rob(:,1:3),linspace(1,max(sarima_num),length(rob_time)));
+V_par=interp1(sarima_num,V_compensated_mag(1:134597),linspace(1,max(sarima_num),length(rob_time)));
+
+plot(linspace(1,max(sarima_num),length(rob_time)),V_par);
+
+%采样频率确定
+x_par=linspace(1,max(sarima_num),length(rob_time));
+
+k=2;
+%取10个周期，从倒数第kn个周期开始
+kn=18;
+num_T=10;
+x=V_par(128739-6328*kn:k:128739-(6328*(kn-num_T)));
+x_par=x_par(128739-6328*kn:k:128739-(6328*(kn-num_T)));
+% figure();
+% plot(x_par(end-T*5:end),x(end-T*5:end));
+
+
+x_acf=autocorr(x,'NumLags',3146*5);
+%寻找周期
+[Ty,Tx0]=findpeaks(x_acf,'MinPeakDistance',2000);
+Tx=[];T=[];
+for i=1:length(Ty)
+    if Ty(i)>0.1
+        Tx=[Tx,Tx0(i)];
+    end
+end
+for i=2:length(Tx)
+    if Tx(i)-Tx(i-1)>1000
+    T=[T,Tx(i)-Tx(i-1)];
+    end
+end
+
+%为使序列平稳，进行差分，得到d和D。在该序列中，d为0，D为2
+%先进行一阶差分
+D=1;
+ S=round(mean(T));
+
+xd=[];xdD=[];
+for i=S+1:length(x)
+    xd=[xd,x(i)-x(i-S)];
+end
+
+
+for i=S+1:length(xd)
+    xdD=[xdD,xd(i)-xd(i-S)];
+end
+figure();
+plot(xd);hold on;
+ 
+figure;
+subplot(3,1,1);
+T=6398/k-150/k;
+plot(x(end-T*5:end));
+title('原数据');
+sys = arima('Constant',NaN,'ARLags',1:4,'D',0,'MALags',1:2,'SARLags',[12,24,36,48],'Seasonality',12,'SMALags',12,'Distribution','Gaussian');
+
+
+subplot(3,1,2);
+plot(x_acf);
+title('自相关函数');
+
+x_pacf=parcorr(x);
+subplot(3,1,3);
+% plot(x_pacf) ;
+% title('偏自相关函数');
+plot(xd(end-T*5:end)) ;
+title('一阶季节差分');
+
+
+
+% 原始序列的 ADF 检验
+[h, pValue, stat, cValue] = adftest(xd, 'alpha', 0.05);
+disp(['adf检验: h = ', num2str(h), ', pValue = ', num2str(pValue)]);
+figure();
+autocorr(xd,'NumLags',30);
+figure();
+parcorr(xd,'NumLags',30);
+[hd, pValued] = lbqtest(xd, 'Lags', [10, 20]);
+disp(['lbq检验: h = ', num2str(hd), ', pValue = ', num2str(pValued)]);
+
+% 初始化SARIMA参数搜索范围
+orderRange = struct();
+
+% 非季节性部分 SARIMA(p,d,q)
+orderRange.p = 2:6;      % 非季节性AR阶数
+orderRange.d = 0;        % 非季节性差分阶数
+orderRange.q = 2:6;      % 非季节性MA阶数
+
+% 季节性部分 SARIMA(P,D,Q)_s
+orderRange.P = 0:1;      % 季节性AR阶数
+orderRange.D = 0:1;      % 季节性差分阶数
+orderRange.Q = 0:1;      % 季节性MA阶数
+orderRange.s = S;        % 季节周期
+
+[results, best] = SARIMA_search(x, orderRange);
+
+EstMdl=best;
+
+
+%预测结果
+%% 
+tic;
+step = S; %预测步数为一个周期
+[forData,YMSE] = forecast(EstMdl,step,'Y0',x(end-S*4:end-round(S*1/2))');   %matlab2018及以下版本写为Predict_Y(i+1) = forecast(EstMdl,1,'Y0',Y(1:i)); 
+elapsedTime=toc;
+%% 
+
+
+
+
+%% 三种对比方法
+
+%% 对比方法01：时域对比试验
+num_T=16;
+x_t=V_compensated_mag(128739-6328*kn:k:128739-(6328*(kn-num_T)));
+taxis=linspace(1,0.004*length(V_compensated_mag),length(V_compensated_mag));
+taxis_exp=taxis(128739-6328*kn:k:128739-(6328*(kn-num_T)));
+% [forData,YMSE] = forecast(EstMdl,step,'Y0',x(end-S*4:end-round(S*1/2))');   %matlab2018及以下版本写为Predict_Y(i+1) = forecast(EstMdl,1,'Y0',Y(1:i)); 
+trainData_raw_t=x_t(1:end-S);
+
+
+mu = mean(trainData_raw_t);
+sig = std(trainData_raw_t);
+trainData_t = (trainData_raw_t - mu) / sig; % 网络只看标准化后的数据
+
+testdata_t = x_t(end-S+1:end);
+predLength = S; 
+windowSize = S*1.5; % 【核心修正】：扩大感受野，包含完整的波动周期
+
+
+
+%% 3. 调用三种对比方法 (静态时域预测)
+
+
+
+fprintf('Training and Predicting using LSTM...\n');
+[YPred_LSTM_t, lstmNet_t] = predict_LSTM(trainData_t, predLength, 1/3*windowSize);
+
+fprintf('Training and Predicting using SVM...\n');
+[YPred_SVM_t, svmModel_t] = predict_SVM(trainData_t, predLength, windowSize);
+
+
+fprintf('Training and Predicting using 1D-CNN...\n');
+[YPred_CNN_t, cnnNet_t] = predict_CNN(trainData_t, predLength, windowSize);
+
+%误差评估与可视化 (时域展示，后续你需要自己映射到参数域)
+%反标准化 (Inverse Transform) 与误差评估
+% 将模型预测出的标准化数值，还原回真实的物理速度单位 (mm/s)
+YPred_SVM_t  = YPred_SVM_t * sig + mu;
+YPred_CNN_t  = YPred_CNN_t * sig + mu;
+YPred_LSTM_t = YPred_LSTM_t * sig + mu;
+
+% 计算真实误差
+RMSE_SVM_t  = rmse(YPred_SVM_t, testdata_t);
+RMSE_CNN_t = rmse(YPred_CNN_t, testdata_t);
+RMSE_LSTM_t = rmse(YPred_LSTM_t, testdata_t);
+
+
+
+
+fprintf('=== 测试集 RMSE 对比 ===\n');
+fprintf('SVM:  %.4f\n', RMSE_SVM_t);
+fprintf('CNN:  %.4f\n', RMSE_CNN_t);
+fprintf('LSTM: %.4f\n', RMSE_LSTM_t);
+
+%取10个周期，从倒数第kn个周期开始
+
+%% 第二组实验，用参数域上的规整序列来预测
+kn=18;
+num_T=10;
+v_time=V_compensated_mag(128739-6328*kn:k:128739-(6328*(kn-num_T)));
+axis_t=[128739-6328*kn:k:128739-(6328*(kn-num_T))]*0.004;
+
+%采样频率确定
+x_par=linspace(1,max(sarima_num),length(rob_time));
+
+k=2;
+%取10个周期，从倒数第kn个周期开始
+kn=18;
+num_T=10;
+x_exp=V_par(128739-6328*kn:k:128739-(6328*(kn-num_T)));
+x_par_exp=x_par(128739-6328*kn:k:128739-(6328*(kn-num_T)));
+% [forData,YMSE] = forecast(EstMdl,step,'Y0',x(end-S*4:end-round(S*1/2))');   %matlab2018及以下版本写为Predict_Y(i+1) = forecast(EstMdl,1,'Y0',Y(1:i)); 
+x=V_par(128739-6328*kn:k:128739-(6328*(kn-num_T)));
+x_par=x_par(128739-6328*kn:k:128739-(6328*(kn-num_T)));
+% [forData,YMSE] = forecast(EstMdl,step,'Y0',x(end-S*4:end-round(S*1/2))');   %matlab2018及以下版本写为Predict_Y(i+1) = forecast(EstMdl,1,'Y0',Y(1:i)); 
+trainData_raw_p=x(1:end-S);
+
+
+mu = mean(trainData_raw_p);
+sig = std(trainData_raw_p);
+trainData_p = (x - mu) / sig; % 网络只看标准化后的数据
+
+splitIdx_p=length(trainData_raw_p);
+testdata_p=x(splitIdx_p+1:end);
+predLength = S; 
+windowSize = S*1.5; % 【核心修正】：扩大感受野，包含完整的波动周期
+
+
+
+%调用三种对比方法 (静态时域预测)
+fprintf('Training and Predicting using SVM...\n');
+[YPred_SVM_p, svmModel] = predict_SVM(trainData_p, predLength, windowSize);
+
+
+fprintf('Training and Predicting using 1D-CNN...\n');
+[YPred_CNN_p, cnnNet] = predict_CNN(trainData_p, predLength, windowSize);
+
+
+fprintf('Training and Predicting using LSTM...\n');
+[YPred_LSTM_p, lstmNet] = predict_LSTM(trainData_p, predLength, 1/3*windowSize);
+
+
+
+%误差评估与可视化 (时域展示，后续你需要自己映射到参数域)
+%反标准化 (Inverse Transform) 与误差评估
+% 将模型预测出的标准化数值，还原回真实的物理速度单位 (mm/s)
+YPred_SVM_p  = YPred_SVM_p * sig + mu;
+YPred_CNN_p  = YPred_CNN_p * sig + mu;
+YPred_LSTM_p = YPred_LSTM_p * sig + mu;
+
+% 计算真实误差
+RMSE_SVM_p  = rmse(YPred_SVM_p, testdata_p');
+RMSE_CNN_p = rmse(YPred_CNN_p, testdata_p');
+RMSE_LSTM_p = rmse(YPred_LSTM_p, testdata_p);
+
+
+
+
+
+%% 预测时间对比
+currentInput = x_exp(end-windowSize+1-S : end-S)';
+mu = mean(currentInput);
+sig = std(currentInput);
+currentInput = (currentInput - mu) / sig; % 网络只看标准化后的数据
+
+testdata_p = x_exp(end-S+1:end);
+% plot(x_par_exp,x_exp);hold on;
+% plot(x_par,x);hold on;
+% plot(x_par_exp(end-windowSize+1-S : end-S),currentInput);hold on;
+% plot(x_par_exp(end-S+1:end),x_exp(end-S+1:end));hold on;
+
+%SVM方法：
+SVs = svmModel.SupportVectors;       % 支持向量 [N_SV x d]
+alphas = svmModel.Alpha;             % 权重系数 [N_SV x 1]
+bias = svmModel.Bias;                 % 偏置标量 b
+gamma = 1 / (svmModel.KernelParameters.Scale^2); % RBF核参数 gamma
+SVs_sq = sum(SVs.^2, 2);              % [N_SV x 1] 的列向量
+YPred_SVM_p = zeros(predLength, 1);
+currentInput_temp = currentInput;     % [d x 1] 的列向量
+
+tic;
+for i = 1:predLength
+    input_sq = sum(currentInput_temp.^2); 
+    distSq = SVs_sq + input_sq - 2 * (SVs * currentInput_temp); % [N_SV x 1]
+    kVal = exp(-gamma * distSq);      % [N_SV x 1]
+    predVal = kVal' * alphas + bias;  % 标量
+    YPred_SVM_p(i) = predVal;
+    currentInput_temp = [currentInput_temp(2:end); predVal]; % 保持 [d x 1] 列向量
+end
+time_SVM = toc;
+
+%1D-CNN方法：
+    YPred_CNN_p = zeros(predLength, 1);
+    tic;    
+    for i = 1:predLength
+        netInput = reshape(currentInput, [windowSize, 1, 1]);
+        predVal = predict(cnnNet, netInput);
+        
+        scalarPred = double(predVal(1));
+        YPred_CNN_p(i) = scalarPred;
+        
+        currentInput = [currentInput(2:end); scalarPred];
+    end
+    time_CNN=toc;
+%Bi-LSTM方法：
+    tic;    
+    YPred_norm = zeros(predLength, 1);
+    mu_train = mean(currentInput);
+    sig_train = std(currentInput);
+   
+    trainDataNorm = (currentInput - mu_train) / sig_train;
+    tempInput = trainDataNorm(end-windowSize+1 : end);
+    currentInput = reshape(tempInput, [1, windowSize]);
+
+    YPred_norm = predict(lstmNet, {currentInput}, 'ExecutionEnvironment', 'cpu');
+   
+    YPred_LSTM_p = YPred_norm * sig_train + mu_train;
+    time_LSTM=toc;
+
+p=6;q=6;P=1;Q=0;D=1;d=0;s=S;
+tic;
+[coeffs, y_pred_fs] = fast_sarima(p, d, q, P, D, Q, s, x_exp(end-3*S+1 : end-S)', s);
+time_proposed=toc;
+RMSE_Proposed_p = rmse(y_pred_fs, testdata_p');
+
+YPred_SVM_p  = YPred_SVM_p * sig + mu;
+YPred_CNN_p  = YPred_CNN_p * sig + mu;
+YPred_LSTM_p  = YPred_LSTM_p * sig + mu;
+
+
+predict_window=linspace(1,s/2,s/2);
+RMSE_SVM_p1  = rmse(YPred_SVM_p(predict_window), testdata_p(predict_window)');
+RMSE_CNN_p1 = rmse(YPred_CNN_p(predict_window), testdata_p(predict_window)');
+RMSE_LSTM_p1 = rmse(YPred_LSTM_p(predict_window), testdata_p(predict_window));
+RMSE_Proposed_p1 = rmse(y_pred_fs(predict_window), testdata_p(predict_window)');
+
+
+
+fprintf('=== 测试集 RMSE 对比 ===\n');
+fprintf('SVM:  %.4f | 耗时: %.2fs\n', RMSE_SVM_p1, time_SVM);
+fprintf('CNN:  %.4f | 耗时: %.2fs\n', RMSE_CNN_p1, time_CNN);
+fprintf('LSTM: %.4f | 耗时: %.2fs\n', RMSE_LSTM_p1, time_LSTM);
+fprintf('Proposed: %.4f | 耗时: %.2fs\n', RMSE_Proposed_p1, time_proposed);
+
+
+%残差计算
+x_gt=x_exp(end-S+1:end-S/2);
+x_svm=YPred_SVM_p(predict_window)';
+x_cnn=YPred_CNN_p(predict_window)';
+x_lstm=YPred_LSTM_p(predict_window);
+x_proposed=y_pred_fs(predict_window)';
+
+r_svm=x_svm-x_gt;
+r_cnn=x_cnn-x_gt;
+r_lstm=x_lstm-x_gt;
+r_proposed=x_proposed-x_gt;
+
+s_svm=sum(r_svm);
+s_cnn=sum(r_cnn);
+s_lstm=sum(r_lstm);
+s_proposed=sum(r_proposed);
+fprintf('=== 残差和 对比 ===\n');
+fprintf('SVM:  %.4f\n', s_svm);
+fprintf('CNN:  %.4f\n', s_cnn);
+fprintf('LSTM: %.4f\n', s_lstm);
+fprintf('Proposed: %.4f\n', s_proposed);
+
+
